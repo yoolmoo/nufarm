@@ -7,6 +7,8 @@ from ultralytics import YOLO
 from flask_cors import CORS
 import requests
 from flasgger import Swagger
+from datetime import datetime
+
 
 app = Flask(__name__)
 CORS(app)
@@ -52,39 +54,42 @@ status = False # 감지 상태 저장
 freeze_status = False # 상태 정보 고정
 status_lock = threading.Lock() # 동시 접근 제어를 위한 lock
 
-# 백엔드로 이상감지 정보 전달
-def send_notification(class_counts):
-    url = "http://3.34.153.235:8080/api/notification/save?userId=1"
-    params = {
-        'hole': class_counts.get('hole', 0),
-        'wither': class_counts.get('wither', 0),
-        'timestamp': datetime.now().isoformat()  # 현재 시간을 ISO 형식으로 추가
-    }
 
-    headers = {
-        'Authorization': 'Bearer YOUR_API_TOKEN'  # 필요하다면 인증 토큰 추가
-    }
-    
-    print(f"Sending request to {url} with params: {params}")
+# # 백엔드로 이상감지 정보 전달
+# def send_notification(detected_counts):
+#     url = "http://3.34.153.235:8080/api/notification/save"
+#     params = {
+#         'userId': 1,
+#         'hole': detected_counts.get('hole', 0),
+#         'wither': detected_counts.get('wither', 0),
+#         'timestamp': datetime.now().isoformat()  # 현재 시간을 ISO 형식으로 추가
+#     }
 
-    try:
-        response = requests.get(url, params=params)
-        if response.status_code == 200:
-            print("Notification sent successfully.")
-        else:
-            print(f"Failed to send notification: {response.status_code}")
-    except Exception as e:
-        print(f"Error sending notification: {e}")
+#     print(f"Sending GET request to {url} with params: {params}")
 
-def capture_image_periodically(model, img_path, class_names, class_colors):
-    global status, freeze_status
+#     try:
+#         response = requests.get(url, params=params)
+#         if response.status_code == 200:
+#             print("Notification sent successfully.")
+#         else:
+#             print(f"Failed to send notification: {response.status_code} - {response.text}")
+#     except Exception as e:
+#         print(f"Error sending notification: {e}")
+
+class_counts = {0: 0, 1: 0}
+
+def abnormal(model, img_path, class_names, class_colors, sleep_time):
+    global status, freeze_status, class_counts
     while True:
-        camera.grab()
-        ret, frame = camera.retrieve()
+        with lock:
+            camera.grab()
+            ret, frame = camera.retrieve()
+            
 
         if ret:
             results = model(frame)
             detected_counts = {name: 0 for name in class_names.values()}
+            class_counts = {0: 0, 1: 0}
 
             # 감지된 객체 처리
             for result in results:
@@ -98,6 +103,7 @@ def capture_image_periodically(model, img_path, class_names, class_colors):
                     # 감지된 클래스별 개수 증가
                     if label in detected_counts:
                         detected_counts[label] += 1
+                        class_counts[label_id] += 1
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, f'{label}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
@@ -112,7 +118,7 @@ def capture_image_periodically(model, img_path, class_names, class_colors):
             elif any(count > 0 for count in detected_counts.values()):
                 with status_lock:
                     status = True
-                    # print("Status changed to True due to new detection.")
+                    # send_notification(detected_counts)  # 이상 감지가 발생한 경우 백엔드로 알림 전송
 
             # 감지된 객체가 없는 경우 상태를 False로 유지
             else:
@@ -125,15 +131,44 @@ def capture_image_periodically(model, img_path, class_names, class_colors):
             with lock:
                 cv2.imwrite(img_path, frame)
 
-        time.sleep(2) # 나중에 0.1로 바꾸기
+        time.sleep(sleep_time)
 
-# 스레드 생성 (model1에 대한 감지)
-thread1 = threading.Thread(target=capture_image_periodically, args=(model1, img_path1, class_names_model1, class_colors_model1))
+
+def growth(model, img_path, class_names, class_colors, sleep_time):
+    global status, freeze_status, class_counts
+    while True:
+        with lock:
+            camera.grab()
+            ret, frame = camera.retrieve()
+            
+
+        if ret:
+            results = model(frame)
+
+            # 감지된 객체 처리
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    label_id = int(box.cls)
+                    color = class_colors.get(label_id, (255, 255, 255))
+                    label = class_names.get(label_id, 'Unknown')
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f'{label}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+            with lock:
+                cv2.imwrite(img_path, frame)
+
+        time.sleep(sleep_time)
+
+# 스레드 생성 (model1에 대한 감지, 나중에 2 >> 0.1로 바꾸기)
+thread1 = threading.Thread(target=abnormal, args=(model1, img_path1, class_names_model1, class_colors_model1, 2))
 thread1.daemon = True
 thread1.start()
 
-# 스레드 생성 (model2에 대한 감지)
-thread2 = threading.Thread(target=capture_image_periodically, args=(model2, img_path2, class_names_model2, class_colors_model2))
+# 스레드 생성 (model2에 대한 감지, 나중에 3 >> 0.1로 바꾸기)
+thread2 = threading.Thread(target=growth, args=(model2, img_path2, class_names_model2, class_colors_model2, 3))
 thread2.daemon = True
 thread2.start()
 
@@ -181,6 +216,16 @@ def reset_status():
         freeze_status = True  # 100초간 false로 고정
     print(f'Status = {status}')
     return jsonify({'status': status})
+
+# 3) 유림 >> 건우 : 클래스별 박스 개수를 반환하는 API
+@app.route('/get_class_counts', methods=['GET'])
+def get_class_counts():
+    global class_counts  # 전역 변수 사용
+    # 클래스 개수를 JSON 형식으로 반환
+    return jsonify({
+        'hole': class_counts[0],
+        'wither': class_counts[1]
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
